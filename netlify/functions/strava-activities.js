@@ -11,11 +11,12 @@ exports.handler = async function (event) {
     return { statusCode: 401, body: JSON.stringify({ error: "Missing bearer token" }) };
   }
 
-  const perPage = event.queryStringParameters?.per_page || "40";
+  const perPage = event.queryStringParameters?.per_page || "200";
+  const page = event.queryStringParameters?.page || "1";
 
   try {
     const res = await fetch(
-      `https://www.strava.com/api/v3/athlete/activities?per_page=${encodeURIComponent(perPage)}`,
+      `https://www.strava.com/api/v3/athlete/activities?per_page=${encodeURIComponent(perPage)}&page=${encodeURIComponent(page)}`,
       { headers: { Authorization: authHeader } }
     );
 
@@ -45,7 +46,9 @@ exports.handler = async function (event) {
     return {
       statusCode: 200,
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ rides }),
+      // rawCount (pre-filter) tells the frontend whether Strava returned a
+      // full page — if so, there may be more pages to fetch.
+      body: JSON.stringify({ rides, rawCount: data.length }),
     };
   } catch (err) {
     return { statusCode: 502, body: JSON.stringify({ error: "Could not reach Strava", details: String(err) }) };
