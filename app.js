@@ -2,16 +2,17 @@
   "use strict";
 
   const STORAGE_KEY = "ridelog_tokens";
-  const UNITS_KEY = "ridelog_units";
   const main = document.getElementById("main");
   const topbarStatus = document.getElementById("topbarStatus");
   const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
 
   let allRides = [];
   let athleteInfo = null;
-  let currentUnits = localStorage.getItem(UNITS_KEY) || (navigator.language === "en-US" ? "imperial" : "metric");
-  let filters = { year: "all", week: "all" };
-  let detailMap = null; // Leaflet instance inside the ride modal, if open
+  let filters = { year: "all", month: "all", week: "all" };
+  let activeModalMap = null; // Leaflet instance inside whichever modal is open
+  let simCache = null; // { lat, lon, displayName, address } from the last successful geocode
+
+  const MONTH_NAMES = ["January","February","March","April","May","June","July","August","September","October","November","December"];
 
   // ---------------------------------------------------------------
   // storage helpers
@@ -32,29 +33,23 @@
   }
 
   // ---------------------------------------------------------------
-  // unit conversion + formatting
+  // formatting (metric only)
   // ---------------------------------------------------------------
   function fmtDistance(meters) {
-    return currentUnits === "imperial"
-      ? { value: (meters / 1609.344).toFixed(1), unit: "mi" }
-      : { value: (meters / 1000).toFixed(1), unit: "km" };
+    return { value: (meters / 1000).toFixed(1), unit: "km" };
   }
   function fmtElevation(meters) {
-    return currentUnits === "imperial"
-      ? { value: Math.round(meters * 3.28084).toLocaleString(), unit: "ft" }
-      : { value: Math.round(meters).toLocaleString(), unit: "m" };
+    return { value: Math.round(meters).toLocaleString(), unit: "m" };
   }
   function fmtSpeed(mps) {
-    return currentUnits === "imperial"
-      ? { value: (mps * 2.23694).toFixed(1), unit: "mph" }
-      : { value: (mps * 3.6).toFixed(1), unit: "km/h" };
+    return { value: (mps * 3.6).toFixed(1), unit: "km/h" };
   }
   function fmtPace(mps) {
     if (!mps) return "–";
-    const secPerUnit = currentUnits === "imperial" ? 1609.344 / mps : 1000 / mps;
-    const m = Math.floor(secPerUnit / 60);
-    const s = Math.round(secPerUnit % 60);
-    return `${m}:${String(s).padStart(2, "0")} /${currentUnits === "imperial" ? "mi" : "km"}`;
+    const secPerKm = 1000 / mps;
+    const m = Math.floor(secPerKm / 60);
+    const s = Math.round(secPerKm % 60);
+    return `${m}:${String(s).padStart(2, "0")} /km`;
   }
   function fmtTime(totalSeconds) {
     const h = Math.floor(totalSeconds / 3600);
@@ -84,7 +79,8 @@
   }
 
   // ---------------------------------------------------------------
-  // Google encoded polyline algorithm (used by Strava's *_polyline fields)
+  // Google encoded polyline algorithm (Strava *_polyline fields, and
+  // OSRM's geometries=polyline output use the same encoding)
   // ---------------------------------------------------------------
   function decodePolyline(str) {
     let index = 0, lat = 0, lng = 0, coordinates = [];
@@ -113,11 +109,11 @@
   }
 
   // ---------------------------------------------------------------
-  // week / year helpers (Monday-start weeks, local time)
+  // week / month / year helpers (Monday-start weeks, local time)
   // ---------------------------------------------------------------
   function getWeekStart(d) {
     const date = new Date(d.getFullYear(), d.getMonth(), d.getDate());
-    const day = date.getDay(); // 0=Sun..6=Sat
+    const day = date.getDay();
     const diffToMonday = day === 0 ? -6 : 1 - day;
     date.setDate(date.getDate() + diffToMonday);
     return date;
@@ -137,10 +133,21 @@
   function getAvailableYears(rides) {
     return [...new Set(rides.map((r) => new Date(r.date).getFullYear()))].sort((a, b) => b - a);
   }
-  function getAvailableWeeks(rides, year) {
+  function getAvailableMonths(rides, year) {
+    const set = new Set(
+      rides.filter((r) => new Date(r.date).getFullYear() === year).map((r) => new Date(r.date).getMonth())
+    );
+    return [...set].sort((a, b) => a - b).map((m) => ({ value: m, label: MONTH_NAMES[m] }));
+  }
+  function getAvailableWeeks(rides, year, month) {
     const map = new Map();
     rides
-      .filter((r) => new Date(r.date).getFullYear() === year)
+      .filter((r) => {
+        const d = new Date(r.date);
+        if (d.getFullYear() !== year) return false;
+        if (month !== "all" && d.getMonth() !== Number(month)) return false;
+        return true;
+      })
       .forEach((r) => {
         const d = new Date(r.date);
         const key = weekKey(d);
@@ -154,15 +161,19 @@
     return rides.filter((r) => {
       const d = new Date(r.date);
       if (f.year !== "all" && d.getFullYear() !== Number(f.year)) return false;
+      if (f.month !== "all" && d.getMonth() !== Number(f.month)) return false;
       if (f.week !== "all" && weekKey(d) !== f.week) return false;
       return true;
     });
   }
   function periodLabel(f) {
     if (f.year === "all") return "All time";
-    if (f.week === "all") return String(f.year);
-    const [y, m, d] = f.week.split("-").map(Number);
-    return formatWeekLabel(new Date(y, m - 1, d)) + `, ${f.year}`;
+    if (f.week !== "all") {
+      const [y, m, d] = f.week.split("-").map(Number);
+      return formatWeekLabel(new Date(y, m - 1, d)) + `, ${f.year}`;
+    }
+    if (f.month !== "all") return `${MONTH_NAMES[Number(f.month)]} ${f.year}`;
+    return String(f.year);
   }
 
   // ---------------------------------------------------------------
@@ -238,7 +249,7 @@
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "Could not load activities");
       all = all.concat(data.rides);
-      if (!data.rawCount || data.rawCount < perPage) break; // reached the last page
+      if (!data.rawCount || data.rawCount < perPage) break;
     }
     return all;
   }
@@ -331,7 +342,8 @@
 
     const filtered = filterRides(allRides, filters);
     const years = getAvailableYears(allRides);
-    const weeks = filters.year === "all" ? [] : getAvailableWeeks(allRides, Number(filters.year));
+    const months = filters.year === "all" ? [] : getAvailableMonths(allRides, Number(filters.year));
+    const weeks = filters.year === "all" ? [] : getAvailableWeeks(allRides, Number(filters.year), filters.month);
 
     const totals = computeTotals(filtered);
     const dist = fmtDistance(totals.distance);
@@ -347,15 +359,16 @@
             <option value="all" ${filters.year === "all" ? "selected" : ""}>All time</option>
             ${years.map((y) => `<option value="${y}" ${filters.year === String(y) ? "selected" : ""}>${y}</option>`).join("")}
           </select>
+          <select id="monthFilter" class="filter-select" ${filters.year === "all" ? "disabled" : ""}>
+            <option value="all" ${filters.month === "all" ? "selected" : ""}>All months</option>
+            ${months.map((m) => `<option value="${m.value}" ${filters.month === String(m.value) ? "selected" : ""}>${m.label}</option>`).join("")}
+          </select>
           <select id="weekFilter" class="filter-select" ${filters.year === "all" ? "disabled" : ""}>
             <option value="all" ${filters.week === "all" ? "selected" : ""}>All weeks</option>
             ${weeks.map((w) => `<option value="${w.key}" ${filters.week === w.key ? "selected" : ""}>${w.label}</option>`).join("")}
           </select>
         </div>
-        <div class="unit-toggle">
-          <button data-unit="imperial" class="${currentUnits === "imperial" ? "active" : ""}">mi</button>
-          <button data-unit="metric" class="${currentUnits === "metric" ? "active" : ""}">km</button>
-        </div>
+        <button id="simulateBtn" class="link-btn">Simulate ride</button>
       </div>
 
       <div class="hero">
@@ -437,9 +450,14 @@
       });
     }
 
-    // filter + unit controls
     document.getElementById("yearFilter").addEventListener("change", (e) => {
       filters.year = e.target.value;
+      filters.month = "all";
+      filters.week = "all";
+      renderDashboard();
+    });
+    document.getElementById("monthFilter").addEventListener("change", (e) => {
+      filters.month = e.target.value;
       filters.week = "all";
       renderDashboard();
     });
@@ -447,13 +465,7 @@
       filters.week = e.target.value;
       renderDashboard();
     });
-    document.querySelectorAll(".unit-toggle button").forEach((btn) => {
-      btn.addEventListener("click", () => {
-        currentUnits = btn.dataset.unit;
-        localStorage.setItem(UNITS_KEY, currentUnits);
-        renderDashboard();
-      });
-    });
+    document.getElementById("simulateBtn").addEventListener("click", openSimulateModal);
 
     renderMap(filtered);
   }
@@ -495,7 +507,7 @@
   }
 
   // ---------------------------------------------------------------
-  // ride detail modal
+  // shared modal shell (used by both ride-detail and simulate-ride)
   // ---------------------------------------------------------------
   function ensureModalRoot() {
     let overlay = document.getElementById("modalOverlay");
@@ -526,9 +538,21 @@
     const overlay = document.getElementById("modalOverlay");
     if (!overlay) return;
     overlay.classList.remove("open");
-    if (detailMap) { detailMap.remove(); detailMap = null; }
+    if (activeModalMap) { activeModalMap.remove(); activeModalMap = null; }
   }
 
+  function statTile(label, value, unit) {
+    if (value === null || value === undefined) return "";
+    return `
+      <div class="mini-stat">
+        <div class="mini-num">${value}${unit ? `<span class="mini-unit">${unit}</span>` : ""}</div>
+        <div class="mini-label">${label}</div>
+      </div>`;
+  }
+
+  // ---------------------------------------------------------------
+  // ride detail modal
+  // ---------------------------------------------------------------
   async function openRideDetail(id) {
     const overlay = ensureModalRoot();
     const body = document.getElementById("modalBody");
@@ -545,22 +569,13 @@
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "Could not load ride");
 
-      renderModalContent(data.activity);
+      renderRideDetail(data.activity);
     } catch (err) {
       body.innerHTML = `<div class="error-box">${escapeHtml(err.message || String(err))}</div>`;
     }
   }
 
-  function statTile(label, value, unit) {
-    if (value === null || value === undefined) return "";
-    return `
-      <div class="mini-stat">
-        <div class="mini-num">${value}${unit ? `<span class="mini-unit">${unit}</span>` : ""}</div>
-        <div class="mini-label">${label}</div>
-      </div>`;
-  }
-
-  function renderModalContent(a) {
+  function renderRideDetail(a) {
     const dist = fmtDistance(a.distance);
     const elev = fmtElevation(a.elevation_gain);
     const speed = fmtSpeed(a.avg_speed);
@@ -580,9 +595,7 @@
       a.kilojoules ? statTile("Work", Math.round(a.kilojoules), "kJ") : "",
       a.avg_cadence ? statTile("Avg cadence", Math.round(a.avg_cadence), "rpm") : "",
       a.calories ? statTile("Calories", Math.round(a.calories), "kcal") : "",
-    ]
-      .filter(Boolean)
-      .join("");
+    ].filter(Boolean).join("");
 
     const socialBits = [
       a.kudos_count ? `${a.kudos_count} kudos` : null,
@@ -598,27 +611,23 @@
       a.commute ? "Commute" : null,
     ].filter(Boolean);
 
-    const splits = currentUnits === "imperial" ? a.splits_standard : a.splits_metric;
+    const splits = a.splits_metric;
     const splitsHtml = splits && splits.length
       ? `
         <div class="section-head" style="margin-top:22px"><h2>Splits</h2></div>
         <div class="splits-table">
-          <div class="splits-head">
-            <div>#</div><div>Time</div><div>Pace</div><div class="elev">Elev</div>
-          </div>
-          ${splits
-            .map((s) => {
-              const e = fmtElevation(s.elevation_difference || 0);
-              const sign = (s.elevation_difference || 0) > 0 ? "+" : "";
-              return `
-                <div class="splits-row">
-                  <div>${s.split}</div>
-                  <div>${fmtClock(s.moving_time)}</div>
-                  <div>${fmtPace(s.average_speed)}</div>
-                  <div class="elev">${sign}${e.value}${e.unit}</div>
-                </div>`;
-            })
-            .join("")}
+          <div class="splits-head"><div>#</div><div>Time</div><div>Pace</div><div class="elev">Elev</div></div>
+          ${splits.map((s) => {
+            const e = fmtElevation(s.elevation_difference || 0);
+            const sign = (s.elevation_difference || 0) > 0 ? "+" : "";
+            return `
+              <div class="splits-row">
+                <div>${s.split}</div>
+                <div>${fmtClock(s.moving_time)}</div>
+                <div>${fmtPace(s.average_speed)}</div>
+                <div class="elev">${sign}${e.value}${e.unit}</div>
+              </div>`;
+          }).join("")}
         </div>`
       : "";
 
@@ -627,30 +636,148 @@
       <div class="modal-date">${fmtFullDate(a.date)}</div>
       ${a.description ? `<p class="modal-desc">${escapeHtml(a.description)}</p>` : ""}
       ${tags.length ? `<div class="tag-row">${tags.map((t) => `<span class="tag">${escapeHtml(t)}</span>`).join("")}</div>` : ""}
-
       <div class="mini-grid">${tiles}</div>
-
       ${socialBits ? `<div class="social-row">${socialBits}</div>` : ""}
-
       ${a.polyline ? `<div id="modalMap" class="modal-map"></div>` : `<div class="map-empty" style="padding:24px 0">No GPS route on this ride.</div>`}
-
       ${splitsHtml}
     `;
 
     if (a.polyline) {
       const latlngs = decodePolyline(a.polyline);
       if (latlngs.length) {
-        detailMap = L.map("modalMap", { scrollWheelZoom: false });
+        activeModalMap = L.map("modalMap", { scrollWheelZoom: false });
         L.tileLayer("https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png", {
           attribution: '&copy; <a href="https://carto.com/attributions">CARTO</a> &copy; OpenStreetMap contributors',
-          subdomains: "abcd",
-          maxZoom: 19,
-        }).addTo(detailMap);
+          subdomains: "abcd", maxZoom: 19,
+        }).addTo(activeModalMap);
         const signalColor = getComputedStyle(document.documentElement).getPropertyValue("--signal").trim() || "#93C23F";
-        L.polyline(latlngs, { color: signalColor, weight: 4, opacity: 0.9 }).addTo(detailMap);
-        detailMap.fitBounds(latlngs, { padding: [16, 16] });
+        L.polyline(latlngs, { color: signalColor, weight: 4, opacity: 0.9 }).addTo(activeModalMap);
+        activeModalMap.fitBounds(latlngs, { padding: [16, 16] });
       }
     }
+  }
+
+  // ---------------------------------------------------------------
+  // simulate-ride modal
+  // ---------------------------------------------------------------
+  function openSimulateModal() {
+    const overlay = ensureModalRoot();
+    overlay.classList.add("open");
+    renderSimulateForm();
+  }
+
+  function renderSimulateForm() {
+    document.getElementById("modalBody").innerHTML = `
+      <h2 class="modal-title">Simulate a ride</h2>
+      <p class="modal-desc">Say about how far you want to go and where you're starting — I'll suggest a loop route of roughly that distance, starting and ending near that address.</p>
+      <div class="sim-form">
+        <label class="sim-label">Distance (km)
+          <input type="number" id="simDistance" min="3" max="200" step="1" value="${simCache?.distanceKm || 30}" class="sim-input" />
+        </label>
+        <label class="sim-label">Starting address
+          <input type="text" id="simAddress" placeholder="e.g. 10 Downing Street, London"
+                 value="${simCache?.address ? escapeHtml(simCache.address) : ""}" class="sim-input" />
+        </label>
+        <button id="simSubmit" class="connect-btn" style="margin-top:6px">Generate route</button>
+        <div id="simError" class="error-box" style="display:none"></div>
+      </div>
+    `;
+    document.getElementById("simSubmit").addEventListener("click", handleSimulateSubmit);
+  }
+
+  async function handleSimulateSubmit() {
+    const distanceKm = Number(document.getElementById("simDistance").value);
+    const address = document.getElementById("simAddress").value.trim();
+    const errorBox = document.getElementById("simError");
+    const btn = document.getElementById("simSubmit");
+
+    if (!address) return showSimError("Enter a starting address.");
+    if (!distanceKm || distanceKm < 3 || distanceKm > 200) return showSimError("Pick a distance between 3 and 200 km.");
+
+    btn.disabled = true;
+    btn.textContent = "Finding your route…";
+    errorBox.style.display = "none";
+
+    try {
+      const geo = await fetch(`/.netlify/functions/geocode?address=${encodeURIComponent(address)}`);
+      const geoData = await geo.json();
+      if (!geo.ok) throw new Error(geoData.error || "Could not find that address");
+
+      simCache = { lat: geoData.lat, lon: geoData.lon, displayName: geoData.displayName, address, distanceKm };
+
+      await generateAndRenderRoute();
+    } catch (err) {
+      btn.disabled = false;
+      btn.textContent = "Generate route";
+      showSimError(err.message || String(err));
+    }
+
+    function showSimError(msg) {
+      errorBox.style.display = "block";
+      errorBox.textContent = msg;
+    }
+  }
+
+  async function generateAndRenderRoute() {
+    const body = document.getElementById("modalBody");
+    body.innerHTML = `<p class="modal-loading">Sketching a ${simCache.distanceKm}km loop near ${escapeHtml(simCache.displayName || simCache.address)}…</p>`;
+
+    try {
+      const res = await fetch("/.netlify/functions/simulate-route", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ lat: simCache.lat, lon: simCache.lon, distanceKm: simCache.distanceKm }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "Could not generate a route for this area");
+
+      renderSimulatedResult(data);
+    } catch (err) {
+      body.innerHTML = `
+        <div class="error-box">${escapeHtml(err.message || String(err))}</div>
+        <button id="simRetryBack" class="link-btn" style="margin-top:14px">Try again</button>
+      `;
+      document.getElementById("simRetryBack").addEventListener("click", renderSimulateForm);
+    }
+  }
+
+  function renderSimulatedResult(route) {
+    document.getElementById("modalBody").innerHTML = `
+      <h2 class="modal-title">${route.distanceKm}km loop</h2>
+      <div class="modal-date">Starting near ${escapeHtml(simCache.displayName || simCache.address)}</div>
+      <div class="mini-grid">
+        ${statTile("Distance", route.distanceKm, "km")}
+        ${statTile("Est. time", fmtClock(route.durationMinutes * 60))}
+      </div>
+      <div id="simMap" class="modal-map"></div>
+      <p class="modal-desc" style="margin-top:14px">A suggested loop, not a real ride — check the route makes sense for your bike and traffic before heading out.</p>
+      <div class="tag-row">
+        <button id="simAnother" class="link-btn">Generate another</button>
+        <button id="simNewSearch" class="link-btn">New search</button>
+      </div>
+    `;
+
+    const latlngs = decodePolyline(route.polyline);
+    if (latlngs.length) {
+      activeModalMap = L.map("simMap", { scrollWheelZoom: false });
+      L.tileLayer("https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png", {
+        attribution: '&copy; <a href="https://carto.com/attributions">CARTO</a> &copy; OpenStreetMap contributors',
+        subdomains: "abcd", maxZoom: 19,
+      }).addTo(activeModalMap);
+      const signalColor = getComputedStyle(document.documentElement).getPropertyValue("--signal").trim() || "#93C23F";
+      L.polyline(latlngs, { color: signalColor, weight: 4, opacity: 0.9 }).addTo(activeModalMap);
+      L.circleMarker(latlngs[0], { radius: 6, color: "#E8A23D", fillColor: "#E8A23D", fillOpacity: 1 }).addTo(activeModalMap);
+      activeModalMap.fitBounds(latlngs, { padding: [16, 16] });
+    }
+
+    document.getElementById("simAnother").addEventListener("click", () => {
+      if (activeModalMap) { activeModalMap.remove(); activeModalMap = null; }
+      generateAndRenderRoute();
+    });
+    document.getElementById("simNewSearch").addEventListener("click", () => {
+      if (activeModalMap) { activeModalMap.remove(); activeModalMap = null; }
+      renderSimulateForm();
+    });
   }
 
   // ---------------------------------------------------------------

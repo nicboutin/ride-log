@@ -35,6 +35,20 @@ Open your site, click **Connect to Strava**, approve access, and your
 dashboard loads. Click **Disconnect** any time to clear the stored session
 from your browser.
 
+- **Filter** by year, month, and week using the dropdowns at the top —
+  each narrows the next (pick a year to unlock months, pick a month to
+  narrow the week list).
+- **Click any ride** in the log, or any route on the map, for a full
+  recap: heart rate, power, cadence, calories, achievements, gear, and
+  per-km splits, if your device recorded them.
+- **Simulate ride** (top right of the filter bar) suggests a loop route
+  of about however many km you ask for, starting near an address you
+  type in. This uses two free public services — OpenStreetMap's
+  Nominatim (address lookup) and a community OSRM routing server — so
+  no extra API keys or setup needed. It's a *suggestion*, not routing
+  guidance: always sanity-check a generated loop against traffic and
+  road conditions before riding it.
+
 ## How it works
 
 - `index.html` / `style.css` / `app.js` — the whole frontend, no build step.
@@ -43,21 +57,32 @@ from your browser.
 - `netlify/functions/strava-auth.js` — the only place your Client Secret is
   used: exchanging Strava's one-time `code` for tokens, and refreshing an
   expired access token.
-- `netlify/functions/strava-activities.js` — fetches your recent rides using
-  the access token and returns the fields the dashboard needs.
+- `netlify/functions/strava-activities.js` — fetches your ride history
+  (paginated) using the access token.
+- `netlify/functions/strava-activity-detail.js` — fetches the full detail
+  for a single ride (heart rate, power, splits, gear, etc.) for the recap view.
+- `netlify/functions/geocode.js` — turns an address into coordinates via
+  Nominatim.
+- `netlify/functions/simulate-route.js` — generates a real-road loop route
+  of roughly the requested distance via a public OSRM server.
 - Your access/refresh tokens are stored in your browser's `localStorage` —
   they're yours, tied to your own device, and never touch anywhere else.
 
 ## Notes & limits
 
 - Free tiers comfortably cover personal use: Netlify's free plan (100GB
-  bandwidth, 125k function calls/month) and Strava's API limits (200
-  requests/15 min, 2,000/day).
-- The dashboard pulls your most recent 40 activities and filters to rides
-  (regular, gravel, and virtual). Change `per_page` in `app.js` /
-  `strava-activities.js` if you want more or fewer.
+  bandwidth, 125k function calls/month), Strava's API limits (200
+  requests/15 min, 2,000/day), and reasonable/occasional use of the
+  public Nominatim and OSRM demo services.
+- The dashboard pulls your full ride history (paginated, up to ~2,000
+  activities) so year/month/week filters have something to filter.
 - Rides without GPS data (manual entries, some trainer rides) won't have a
   route to draw, but still count toward the stats.
+- Simulated routes are a rough suggestion: the loop-shaping algorithm
+  scatters waypoints around your start and asks OSRM for the shortest
+  way to visit them and return — it iterates a few times to land near
+  your requested distance, but road layout in your area can make some
+  distances easier to hit than others.
 - This is built for single-user personal use. If you ever wanted to share
   it with friends, each person would need their own Strava-connected
   session (the current design doesn't support multiple accounts).
